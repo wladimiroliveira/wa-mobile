@@ -89,15 +89,39 @@ modelos Dart são gerados a partir de `../api/openapi.json`, o mesmo arquivo
 versionado de que o `wa-web` gera seus tipos. Um campo que muda no back tem que
 quebrar a análise estática do app, não a tela do operador.
 
-O documento é OpenAPI 3.0.3, com 31 caminhos, uso pesado de `nullable` e poucos
-`anyOf`. O gerador é escolhido na fatia 0 pelo resultado, não pela fama. Os
-candidatos são `swagger_parser` (puro Dart, sem infraestrutura extra) e
-`openapi-generator` com o alvo `dart-dio`. O critério de aceite:
+O documento é OpenAPI 3.0.3, com 31 caminhos, uso pesado de `nullable` e três
+`anyOf`. Nenhuma operação tem `operationId` e nenhum schema é nomeado em
+`components`: tudo está inline.
 
-- campo `nullable` vira tipo anulável em Dart;
-- decimal continua `String` no modelo (ver Decisão 6);
-- enum de permissão e de status vira enum Dart;
-- o código gerado passa na análise estática sem exceções manuais.
+**O gerador é o `swagger_parser`**, escolhido por um teste de geração contra o
+`openapi.json` de `52aa0e1`:
+
+| Critério                         | `swagger_parser` 1.45.0          | `openapi-generator` 7.17.0, `dart-dio` |
+| -------------------------------- | -------------------------------- | -------------------------------------- |
+| Compila                          | sim                              | não: 38 erros com `json_serializable`, 8 com `built_value` |
+| `nullable` vira tipo anulável    | sim                              | sim                                    |
+| Decimal continua `String`        | sim                              | sim                                    |
+| Enum de permissão vira enum Dart | sim, com valor `$unknown`        | sim                                    |
+| Análise estática                 | 4 avisos, no `anyOf` de `POST /productions` | —                           |
+| Nomes                            | estáveis por rota (`GetV1SessionsMeResponse`); numerados nos objetos aninhados (`Product22`) | estáveis |
+
+Ele gera também os clientes HTTP (Retrofit sobre `dio`), um por área da API, já
+com o caminho completo, incluindo `/v1`.
+
+Duas regras compensam o que o gerador não resolve:
+
+- **O código de fatia nunca cita um nome numerado.** Os nomes numerados mudam
+  quando um objeto aninhado aparece em outra rota. Os nomes por rota, não. Um
+  módulo só, `lib/core/api/api.dart`, dá apelidos legíveis aos tipos usados
+  pelo app, como o `api.ts` do `wa-web`. Quando um tipo aninhado precisar de
+  nome, o apelido também mora ali, e uma renumeração quebra a compilação num
+  lugar só.
+- **A pasta gerada fica fora da análise estática.** Os 4 avisos estão em
+  código que não é nosso e que não se edita à mão. O resto do projeto continua
+  sem nenhum aviso aceito.
+
+O conserto de raiz dos nomes numerados é no `wa-api`: nomear os schemas em
+`components`. Está relatado no fim deste documento.
 
 O código gerado é versionado. Uma mudança de contrato aparece no diff, que é
 onde ela deve ser discutida.
@@ -141,9 +165,12 @@ deixam o refresh token onde está e viram nova tentativa.
 ### Ciclo de vida
 
 - **Entrar:** `POST /v1/sessions/signin` guarda o par e busca `GET /v1/sessions/me`.
-- **Reidratar:** ao abrir o app, e ao voltar do segundo plano com o access
-  token vencido, faz refresh serializado. Sucesso segue para a tela pedida,
-  falha vai para o login.
+- **Reidratar:** ao abrir o app, faz refresh serializado. Sucesso segue para a
+  tela pedida, falha vai para o login. Ao voltar do segundo plano, o app não
+  renova por antecipação: a primeira requisição com o access token vencido toma
+  `401` e passa pelo mesmo voo único.
+- **Servidor fora do ar na abertura:** o app mostra uma tela de servidor
+  indisponível com ação de repetir, e o refresh token continua guardado.
 - **Sair:** `POST /v1/sessions/signout` com o refresh token. A limpeza local
   acontece mesmo se a chamada falhar: sair tem que sair.
 - **Reinstalação no iOS:** o Keychain sobrevive à desinstalação do app. Na
@@ -161,6 +188,9 @@ A biometria é um portão local, opcional, sobre a sessão já existente. O
 - Com o desbloqueio ativo, o app exige a biometria ao abrir e ao voltar do
   segundo plano depois de um tempo de inatividade, **antes** de ler o refresh
   token. Sem biometria válida, nada sai do armazenamento.
+- Ao travar por inatividade, o access token em memória é descartado, e a
+  renovação recusa rodar enquanto a sessão estiver travada. Uma requisição que
+  sobrou em segundo plano não consegue contornar o portão.
 - Falhar a biometria ou cancelar leva ao login com senha, sem apagar a sessão
   do servidor.
 - Se o aparelho perder a biometria cadastrada, o desbloqueio é desativado e o
@@ -245,7 +275,7 @@ lib/
     format/       decimal, datas, unidades, GTIN
   ui/             tema, componentes, estados de carregando, erro e vazio
   features/
-    auth/         login, troca de senha, acesso negado, rótulos de permissão
+    auth/         login, desbloqueio, troca de senha, acesso negado
     suppliers/    listar e criar fornecedores
 test/             espelha lib/
 ```
@@ -292,9 +322,11 @@ uma saída. Tela em branco e erro engolido em silêncio não são estados válid
 
 ## Ambiente e build
 
-A base da API vem de `--dart-define=API_BASE_URL=...` e já inclui `/v1`. Ela é
-lida e validada num módulo só, que falha alto no boot se faltar ou não tiver
-esquema `http(s)`.
+A base da API vem de `--dart-define=API_BASE_URL=...` e é **só a origem**
+(`http://localhost:3333`), porque os clientes gerados já trazem `/v1` no
+caminho. Ela é lida e validada num módulo só, que falha alto no boot se faltar,
+não tiver esquema `http(s)` ou trouxer caminho. Essa última regra pega o hábito
+herdado do web, onde a base inclui `/v1`.
 
 **HTTPS é requisito de produção.** Android (cleartext) e iOS (App Transport
 Security) bloqueiam HTTP puro por padrão. Abrir exceção para HTTP só vale no
@@ -417,6 +449,13 @@ escuro. Internacionalização. Personalização de colunas. Vendas: as permissõ
 das lojas, que vem antes da primeira entrega e depois desta fatia.
 
 ## Achados no `wa-api`, relatados e não consertados
+
+- **Schemas sem nome no OpenAPI.** Nenhuma operação tem `operationId` e nenhum
+  schema vai para `components`. Geradores de cliente precisam inventar nomes, e
+  o `swagger_parser` numera os objetos aninhados (`Product1` a `Product27`).
+  Registrar os schemas com nome (por exemplo, o registro de metadados do Zod 4
+  que o `fastify-type-provider-zod` leva para `components`) daria nomes estáveis
+  ao app e ao web.
 
 - **Formato de erro duplo.** Erros de domínio vêm como `{message}`, e erros de
   validação e o `429` vêm no formato padrão do Fastify. O próprio desenho de
